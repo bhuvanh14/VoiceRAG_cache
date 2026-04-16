@@ -1,6 +1,9 @@
 """
 app.py — VoiceRAG-Cache Web Server
 HOW TO RUN:  python app.py  →  open http://localhost:5000
+
+First run: Wikipedia articles are fetched for each domain (~30-60s per domain).
+Subsequent runs: ChromaDB cache is used instantly.
 """
 
 from flask import Flask, render_template, request, jsonify
@@ -13,6 +16,8 @@ from pipeline import VoiceRAGPipeline
 from eval.evaluator import (
     generate_sessions, simulate_voicerag_cache,
     simulate_lru, simulate_lfu, simulate_no_cache,
+    load_real_latencies,
+    DEFAULT_L1_LATENCY, DEFAULT_L2_LATENCY, DEFAULT_RAG_LATENCY,
 )
 
 app       = Flask(__name__)
@@ -23,8 +28,6 @@ def get_pipeline():
     global _pipeline
     if _pipeline is None:
         _pipeline = VoiceRAGPipeline()
-        # Index default domain on startup
-        _pipeline.kb.index_domain("healthcare")
     return _pipeline
 
 
@@ -66,7 +69,7 @@ def index():
     return render_template("index.html")
 
 
-# ── Text query ───────────────────────────────────────────────────────────────
+# ── Text query ────────────────────────────────────────────────────────────────
 @app.route("/query", methods=["POST"])
 def query():
     text = (request.get_json() or {}).get("query", "").strip()
@@ -107,13 +110,13 @@ def voice_query():
         return jsonify({"error": str(e)}), 500
 
 
-# ── Domain switch (Option 3) ─────────────────────────────────────────────────
+# ── Domain switch ─────────────────────────────────────────────────────────────
 @app.route("/switch_domain", methods=["POST"])
 def switch_domain():
     """
-    Switch the active knowledge base domain.
-    Body: { "domain": "healthcare" | "hr" | "legal" }
-    Flushes caches and reindexes for the new domain.
+    Switch knowledge base domain.
+    First switch to a new domain fetches Wikipedia (~30-60s).
+    Subsequent switches are instant (ChromaDB cached).
     """
     domain = (request.get_json() or {}).get("domain", "").strip().lower()
     if domain not in ["healthcare", "hr", "legal"]:
@@ -126,24 +129,36 @@ def switch_domain():
         return jsonify({"error": str(e)}), 500
 
 
-# ── Evaluation ───────────────────────────────────────────────────────────────
+# ── Evaluation (uses real measured latencies) ─────────────────────────────────
 @app.route("/eval", methods=["POST"])
 def run_eval():
     try:
+        latencies = load_real_latencies()
+        if not latencies:
+            latencies = {
+                "l1":  DEFAULT_L1_LATENCY,
+                "l2":  DEFAULT_L2_LATENCY,
+                "rag": DEFAULT_RAG_LATENCY,
+            }
+
         sessions = generate_sessions(100, 10)
         results  = [
-            simulate_voicerag_cache(sessions),
-            simulate_lru(sessions),
-            simulate_lfu(sessions),
-            simulate_no_cache(sessions),
+            simulate_voicerag_cache(sessions, latencies),
+            simulate_lru(sessions, latencies),
+            simulate_lfu(sessions, latencies),
+            simulate_no_cache(sessions, latencies),
         ]
         base = results[-1].avg_latency
-        return jsonify([{
-            "name":     r.name,
-            "hit_rate": round(r.hit_rate * 100, 1),
-            "latency":  round(r.avg_latency),
-            "speedup":  round(base / r.avg_latency, 1) if r.avg_latency else 0,
-        } for r in results])
+        return jsonify({
+            "results": [{
+                "name":     r.name,
+                "hit_rate": round(r.hit_rate * 100, 1),
+                "latency":  round(r.avg_latency),
+                "speedup":  round(base / r.avg_latency, 1) if r.avg_latency else 0,
+            } for r in results],
+            "latencies_used": latencies,
+            "source": "real session data" if load_real_latencies() else "defaults",
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -156,12 +171,16 @@ def reset():
         pl.l1.flush()
         pl.l2.flush()
         pl.logger.new_session()
-        pl.last_predictor = {"evict":[],"prefetch":[],"raw":"","sentiment":"","prefetch_count":0}
+        pl.last_predictor = {
+            "evict":[],"prefetch":[],"raw":"","sentiment":"","prefetch_count":0
+        }
         return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    print("\n🚀  VoiceRAG-Cache  →  http://localhost:5000\n")
+    print("\n🚀  VoiceRAG-Cache  →  http://localhost:5000")
+    print("   First run: Wikipedia articles will be fetched (~30-60s)")
+    print("   Subsequent runs: instant from ChromaDB cache\n")
     app.run(debug=False, port=5000)

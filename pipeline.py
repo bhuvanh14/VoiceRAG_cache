@@ -1,9 +1,9 @@
 """
 pipeline.py — VoiceRAG-Cache Pipeline Orchestrator
 
-Now supports domain switching:
-  pipeline.switch_domain("healthcare" | "hr" | "legal")
-  This rebuilds the knowledge base and RAG engine for the selected domain.
+Knowledge base now powered by Wikipedia.
+On first run for each domain, fetches Wikipedia articles (~30-60s).
+Subsequent runs use cached ChromaDB data (instant).
 """
 
 import time
@@ -30,50 +30,80 @@ class VoiceRAGPipeline:
         self.sentiment  = SentimentClassifier()
         self.l1         = L1Cache()
         self.l2         = L2Cache()
-        self.kb         = KnowledgeBase()
-        self.rag        = RAGEngine(kb=self.kb)
         self.tts        = TTSEngine()
         self.logger     = SessionLogger()
         self.predictor  = CachePredictor()
         self.logger.new_session()
 
-        self.current_domain   = "healthcare"
-        self.last_predictor   = {"evict": [], "prefetch": [], "raw": "",
-                                  "sentiment": "", "prefetch_count": 0}
+        self.current_domain = "healthcare"
+        self.last_predictor = {
+            "evict": [], "prefetch": [], "raw": "",
+            "sentiment": "", "prefetch_count": 0,
+        }
+
+        # Load initial knowledge base (Wikipedia-powered)
+        # Uses cached ChromaDB if already indexed, otherwise fetches from Wikipedia
+        self.kb  = self._load_kb("healthcare")
+        self.rag = RAGEngine(kb=self.kb)
+
         logger.info("Pipeline ready ✅")
 
-    # ── Domain switching (Option 3) ──────────────────────────────────────────
+    # ── Knowledge base loader ─────────────────────────────────────────────────
+    def _load_kb(self, domain: str) -> KnowledgeBase:
+        """
+        Load knowledge base for a domain.
+        First run: fetches Wikipedia articles (~30-60s).
+        Subsequent runs: uses ChromaDB cache (instant).
+        """
+        kb = KnowledgeBase(collection_name=f"kb_{domain}")
+
+        if kb.count() == 0:
+            logger.info(
+                f"No data found for domain '{domain}'. "
+                f"Fetching Wikipedia articles — this takes ~30-60s on first run..."
+            )
+            kb.index_domain(domain, force_reindex=False)
+        else:
+            logger.info(
+                f"Domain '{domain}' loaded from cache — "
+                f"{kb.count()} chunks ready instantly."
+            )
+
+        return kb
+
+    # ── Domain switching ──────────────────────────────────────────────────────
     def switch_domain(self, domain: str) -> dict:
         """
-        Switch the knowledge base to a different domain.
-        Flushes both caches and rebuilds KB + RAG for the new domain.
-        Returns {"status": "ok", "domain": domain, "chunks": N}
+        Switch the active knowledge base to a different domain.
+        Flushes L1 and L2 caches (old answers no longer relevant).
+        Loads new Wikipedia-powered KB (instant if already indexed).
         """
         domain = domain.lower().strip()
         valid  = ["healthcare", "hr", "legal"]
         if domain not in valid:
-            return {"status": "error", "message": f"Unknown domain. Choose from: {valid}"}
+            return {"status": "error", "message": f"Unknown domain. Choose: {valid}"}
 
-        logger.info(f"Switching domain to: {domain}")
+        logger.info(f"Switching domain: {self.current_domain} → {domain}")
         self.current_domain = domain
 
-        # Flush caches — new domain means old answers are irrelevant
+        # Flush caches — old domain answers are irrelevant
         self.l1.flush()
         self.l2.flush()
         self.logger.new_session()
-        self.last_predictor = {"evict": [], "prefetch": [], "raw": "",
-                                "sentiment": "", "prefetch_count": 0}
+        self.last_predictor = {
+            "evict": [], "prefetch": [], "raw": "",
+            "sentiment": "", "prefetch_count": 0,
+        }
 
-        # Rebuild knowledge base for new domain
-        self.kb = KnowledgeBase(collection_name=f"kb_{domain}")
-        self.kb.index_domain(domain)
+        # Load new KB (instant from cache, or ~30-60s first time)
+        self.kb  = self._load_kb(domain)
         self.rag = RAGEngine(kb=self.kb)
 
         chunks = self.kb.count()
-        logger.info(f"Domain switched to '{domain}' — {chunks} chunks indexed.")
+        logger.info(f"Domain switched to '{domain}' — {chunks} chunks ready.")
         return {"status": "ok", "domain": domain, "chunks": chunks}
 
-    # ── Apply predictor decisions ────────────────────────────────────────────
+    # ── Apply predictor decisions ─────────────────────────────────────────────
     def _apply_predictor_decision(self, decision: PredictorDecision):
         self.last_predictor = {
             "evict":          decision.evict,
@@ -95,7 +125,7 @@ class VoiceRAGPipeline:
                 except Exception as e:
                     logger.warning(f"Prefetch failed for '{query}': {e}")
 
-    # ── Core query processor ─────────────────────────────────────────────────
+    # ── Core query processor ──────────────────────────────────────────────────
     def process_query(self, query: str, run_predictor_sync: bool = False) -> dict:
         start = time.time()
 
@@ -154,7 +184,7 @@ class VoiceRAGPipeline:
             "latency_ms":   latency_ms,
         }
 
-    # ── Voice turn ───────────────────────────────────────────────────────────
+    # ── Voice turn ────────────────────────────────────────────────────────────
     def process_voice(self) -> dict:
         query = self.asr.listen_and_transcribe()
         if not query or not query.strip():
@@ -164,7 +194,7 @@ class VoiceRAGPipeline:
         self.tts.speak(result["answer"])
         return result
 
-    # ── Stats ────────────────────────────────────────────────────────────────
+    # ── Stats ─────────────────────────────────────────────────────────────────
     def print_stats(self):
         session = self.logger.current
         if not session:

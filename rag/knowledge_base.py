@@ -1,21 +1,28 @@
 """
 rag/knowledge_base.py
 ----------------------
-ChromaDB knowledge base with domain switching support.
+ChromaDB knowledge base with Wikipedia-powered domain indexing.
 
-Three built-in domains:
-  healthcare — medications, prescriptions, diabetes, appointments
-  hr         — leave policy, onboarding, benefits, payroll
-  legal      — NDAs, IP, contracts, compliance
+On first run for each domain, fetches real Wikipedia articles.
+Results are cached in ChromaDB so subsequent startups are instant.
+
+Three domains with Wikipedia topics:
+  healthcare — hypertension, diabetes, medications, prescriptions
+  hr         — employment law, leave, payroll, performance reviews
+  legal      — NDAs, contracts, IP, data protection
 
 HOW TO RUN:
-    python -m rag.knowledge_base --sample       # index default (healthcare)
-    python -m rag.knowledge_base --domain hr    # index HR domain
+    python -m rag.knowledge_base --domain healthcare
+    python -m rag.knowledge_base --domain hr
+    python -m rag.knowledge_base --domain legal
 """
 
 import os
 import json
+import time
 import argparse
+import urllib.request
+import urllib.parse
 from pathlib import Path
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
@@ -26,94 +33,83 @@ EMBED_MODEL = "all-MiniLM-L6-v2"
 CHUNK_WORDS = 256
 OVERLAP     = 30
 
-# ── Domain sample documents ──────────────────────────────────────────────────
-DOMAIN_DOCS = {
+# ── Wikipedia topics per domain ───────────────────────────────────────────────
+DOMAIN_TOPICS = {
     "healthcare": [
-        ("med_1", "Hypertension, or high blood pressure, is treated using several drug classes. "
-         "ACE inhibitors such as lisinopril relax blood vessels by blocking angiotensin. "
-         "Beta-blockers like metoprolol reduce heart rate and cardiac output. "
-         "Calcium channel blockers and diuretics are also commonly prescribed. "
-         "Lifestyle changes including reduced sodium intake, regular exercise, and weight "
-         "management complement drug therapy significantly."),
-        ("med_2", "Prescription refills can be requested at any pharmacy using your prescription number. "
-         "Most pharmacies offer automatic refill programs that notify you when medication is ready. "
-         "You can also request refills through your doctor's patient portal or by calling the clinic. "
-         "Insurance plans typically cover 30 or 90 day supplies. Emergency refills for controlled "
-         "substances require a new prescription from your physician."),
-        ("med_3", "Diabetes management involves monitoring blood glucose levels regularly, taking insulin "
-         "or oral medications like metformin, and following a balanced diet low in refined carbohydrates. "
-         "Regular HbA1c tests every 3 months track long-term glucose control. Exercise improves insulin "
-         "sensitivity. Type 1 diabetes always requires insulin. Type 2 can often be managed with lifestyle."),
-        ("med_4", "Common side effects of ACE inhibitors include a dry persistent cough, dizziness, "
-         "and elevated potassium levels. Beta-blockers may cause fatigue, cold hands and feet, and "
-         "can mask hypoglycemia symptoms in diabetic patients. Calcium channel blockers can cause "
-         "ankle swelling and constipation. Always consult your physician before stopping any medication."),
-        ("med_5", "Hospital appointments can be scheduled through the patient portal, by calling the "
-         "clinic, or through your insurance provider's referral system. Bring your insurance card, "
-         "photo ID, and a list of current medications to every appointment. Arrive 15 minutes early "
-         "for new patient visits. Telemedicine appointments are available for follow-up consultations."),
-        ("med_6", "Drug interactions are an important safety concern. NSAIDs like ibuprofen can reduce "
-         "the effectiveness of ACE inhibitors and cause kidney problems. Statins combined with certain "
-         "antibiotics can increase the risk of muscle damage. Always inform your pharmacist of all "
-         "medications, supplements, and herbal remedies you are taking to avoid dangerous combinations."),
+        "Hypertension",
+        "ACE_inhibitor",
+        "Beta_blocker",
+        "Calcium_channel_blocker",
+        "Diuretic",
+        "Diabetes_mellitus",
+        "Metformin",
+        "Insulin",
+        "Blood_pressure",
+        "Prescription_drug",
+        "Drug_interaction",
+        "Lisinopril",
+        "Metoprolol",
+        "Antihypertensive_drug",
+        "Glycated_hemoglobin",
     ],
     "hr": [
-        ("hr_1", "Employee onboarding typically covers company policy review, IT account setup, benefits "
-         "enrollment, and team introductions. The standard probation period is 90 days. Health insurance "
-         "and 401k matching become active after 30 days of employment. New employees should complete all "
-         "onboarding paperwork within their first week including tax forms and direct deposit setup."),
-        ("hr_2", "To request time off, submit a leave request through the HR portal at least 5 business "
-         "days in advance for planned leave. Sick leave does not require advance notice but you must "
-         "notify your manager by 9am on the day of absence. Annual leave accrues at 1.5 days per month. "
-         "Unused leave up to 10 days can be carried over to the next calendar year."),
-        ("hr_3", "The performance review cycle runs twice per year — mid-year in June and annual in "
-         "December. Employees receive a self-assessment form two weeks before the review. Ratings are "
-         "on a 5-point scale. Salary adjustments linked to performance take effect from January 1st. "
-         "Promotion recommendations must be submitted by managers before November 30th."),
-        ("hr_4", "Remote work policy allows employees to work from home up to 3 days per week with "
-         "manager approval. Core hours of 10am to 3pm in the local time zone must be observed during "
-         "remote days. A stable internet connection and a dedicated workspace are required. Equipment "
-         "loans including laptops and monitors can be arranged through IT for approved remote workers."),
-        ("hr_5", "Payroll is processed on the 15th and last working day of each month. Direct deposit "
-         "is mandatory for all employees. Pay stubs are available through the HR portal. Overtime is "
-         "paid at 1.5x the base hourly rate for hours exceeding 40 per week. Expense reimbursements "
-         "are processed within 5 business days of submission with valid receipts."),
-        ("hr_6", "The company offers a comprehensive benefits package including health, dental, and vision "
-         "insurance. The 401k plan includes a 4% employer match for contributions up to 6% of salary. "
-         "Employee assistance programs provide free confidential counseling. Tuition reimbursement of "
-         "up to $5000 per year is available for role-related courses approved in advance by HR."),
+        "Annual_leave",
+        "Employment_contract",
+        "Performance_appraisal",
+        "Payroll",
+        "Employee_benefits",
+        "Remote_work",
+        "Sick_leave",
+        "Probation_(employment)",
+        "Onboarding",
+        "401(k)",
+        "Health_insurance_in_the_United_States",
+        "Non-compete_clause",
+        "Overtime",
+        "Tuition_assistance",
+        "Direct_deposit",
     ],
     "legal": [
-        ("leg_1", "A non-disclosure agreement or NDA is a contract establishing confidentiality between "
-         "parties. It defines what information is considered confidential, the obligations of the "
-         "receiving party, and the duration of the agreement. NDAs can be unilateral where only one "
-         "party shares information or mutual where both parties share sensitive information. Breach of "
-         "an NDA can result in injunctive relief and significant financial damages."),
-        ("leg_2", "Intellectual property rights include patents, trademarks, copyrights, and trade secrets. "
-         "Patents protect inventions for 20 years from the filing date. Copyrights protect original "
-         "creative works and arise automatically upon creation without registration. Trademarks protect "
-         "brand identifiers including names, logos, and slogans and can be renewed indefinitely. Trade "
-         "secrets are protected as long as reasonable measures are taken to keep them confidential."),
-        ("leg_3", "Contract formation requires offer, acceptance, and consideration. An offer is a clear "
-         "proposal of terms. Acceptance must mirror the offer exactly — any changes constitute a "
-         "counter-offer. Consideration is the value exchanged, which can be money, services, or a "
-         "promise to act or refrain from acting. Contracts without consideration are generally not "
-         "enforceable. Written contracts are strongly preferred for transactions over $500."),
-        ("leg_4", "Employment contracts typically include terms on compensation, duties, working hours, "
-         "confidentiality obligations, non-compete clauses, and termination conditions. Non-compete "
-         "clauses must be reasonable in scope, geography, and duration to be enforceable. Most "
-         "jurisdictions limit non-competes to 12 months and require geographic restrictions. Always "
-         "have an employment contract reviewed by a qualified attorney before signing."),
-        ("leg_5", "Data protection regulations such as GDPR in Europe and CCPA in California require "
-         "organizations to protect personal data and respect individual rights. Organizations must "
-         "obtain clear consent before collecting personal data, maintain records of data processing, "
-         "and implement appropriate security measures. Individuals have the right to access, correct, "
-         "and delete their personal data. Non-compliance can result in significant regulatory fines."),
-        ("leg_6", "Contract disputes can be resolved through negotiation, mediation, arbitration, or "
-         "litigation. Mediation is a voluntary non-binding process where a neutral mediator helps "
-         "parties reach agreement. Arbitration is typically binding and faster and cheaper than court. "
-         "Many commercial contracts include mandatory arbitration clauses. Litigation should generally "
-         "be a last resort given its cost and time requirements."),
+        "Non-disclosure_agreement",
+        "Intellectual_property",
+        "Patent",
+        "Copyright",
+        "Trademark",
+        "Trade_secret",
+        "Contract",
+        "Consideration_in_contracts",
+        "Arbitration",
+        "Mediation",
+        "General_Data_Protection_Regulation",
+        "California_Consumer_Privacy_Act",
+        "Employment_contract",
+        "Breach_of_contract",
+        "Injunction",
+    ],
+}
+
+# Fallback sample docs if Wikipedia fetch fails
+FALLBACK_DOCS = {
+    "healthcare": [
+        ("med_1", "Hypertension is treated with ACE inhibitors such as lisinopril, beta-blockers like "
+         "metoprolol, calcium channel blockers, and diuretics. Lifestyle changes including reduced "
+         "sodium intake and regular exercise complement drug therapy."),
+        ("med_2", "Prescription refills can be requested at any pharmacy using your prescription number. "
+         "Emergency refills for controlled substances require a new prescription from your physician."),
+        ("med_3", "Diabetes management involves monitoring blood glucose, taking metformin or insulin, "
+         "and following a low-carbohydrate diet. HbA1c tests every 3 months track long-term control."),
+    ],
+    "hr": [
+        ("hr_1", "Annual leave accrues at 1.5 days per month. Submit leave requests through the HR portal "
+         "at least 5 business days in advance. Unused leave up to 10 days can be carried over."),
+        ("hr_2", "Remote work is allowed up to 3 days per week with manager approval. Core hours of "
+         "10am to 3pm must be observed. Equipment loans can be arranged through IT."),
+    ],
+    "legal": [
+        ("leg_1", "A non-disclosure agreement establishes confidentiality between parties. Breach can "
+         "result in injunctive relief and financial damages. NDAs can be unilateral or mutual."),
+        ("leg_2", "Patents protect inventions for 20 years. Copyrights arise automatically upon creation. "
+         "Trademarks protect brand identifiers and can be renewed indefinitely."),
     ],
 }
 
@@ -125,7 +121,52 @@ def chunk_text(text: str) -> list[str]:
     while start < len(words):
         chunks.append(" ".join(words[start: start + CHUNK_WORDS]))
         start += CHUNK_WORDS - OVERLAP
-    return chunks
+    return [c for c in chunks if len(c.split()) > 20]  # skip very short chunks
+
+
+def fetch_wikipedia(topic: str) -> str | None:
+    """
+    Fetch full Wikipedia article text for a topic.
+    Uses the Wikipedia REST API — no API key needed, completely free.
+    Returns the article text or None if not found.
+    """
+    # Try full article first via parse API
+    encoded = urllib.parse.quote(topic)
+    url = (
+        f"https://en.wikipedia.org/w/api.php"
+        f"?action=query&titles={encoded}&prop=extracts&explaintext=true"
+        f"&exsectionformat=plain&format=json&redirects=1"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "VoiceRAG-Cache/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data  = json.loads(r.read())
+            pages = data["query"]["pages"]
+            page  = next(iter(pages.values()))
+            text  = page.get("extract", "")
+            if text and len(text) > 200:
+                logger.info(f"Wikipedia: fetched '{topic}' ({len(text.split())} words)")
+                return text
+    except Exception as e:
+        logger.warning(f"Wikipedia full fetch failed for '{topic}': {e}")
+
+    # Fallback to summary API
+    try:
+        summary_url = (
+            f"https://en.wikipedia.org/api/rest_v1/page/summary/"
+            f"{encoded}"
+        )
+        req = urllib.request.Request(summary_url, headers={"User-Agent": "VoiceRAG-Cache/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+            text = data.get("extract", "")
+            if text:
+                logger.info(f"Wikipedia summary: fetched '{topic}' ({len(text.split())} words)")
+                return text
+    except Exception as e:
+        logger.warning(f"Wikipedia summary fetch failed for '{topic}': {e}")
+
+    return None
 
 
 class KnowledgeBase:
@@ -140,36 +181,117 @@ class KnowledgeBase:
         self._collection_name = collection_name
         logger.info(f"KnowledgeBase '{collection_name}' ready ✅ | {self.col.count()} chunks")
 
-    def index_domain(self, domain: str):
-        """Index built-in domain documents. Clears existing entries first."""
-        docs_list = DOMAIN_DOCS.get(domain)
-        if not docs_list:
+    def index_domain(self, domain: str, force_reindex: bool = False):
+        """
+        Index a domain using Wikipedia articles.
+        If the collection already has content and force_reindex=False,
+        skips indexing (uses cached ChromaDB data).
+        """
+        if self.col.count() > 0 and not force_reindex:
+            logger.info(
+                f"KnowledgeBase already has {self.col.count()} chunks — skipping reindex. "
+                f"Pass force_reindex=True to rebuild."
+            )
+            return
+
+        topics = DOMAIN_TOPICS.get(domain, [])
+        if not topics:
             logger.warning(f"Unknown domain: {domain}")
             return
+
+        logger.info(f"Indexing '{domain}' domain from Wikipedia ({len(topics)} topics)...")
 
         # Clear existing entries
         try:
             existing = self.col.get()
             if existing["ids"]:
                 self.col.delete(ids=existing["ids"])
+                logger.info("Cleared existing entries.")
         except Exception:
             pass
 
         docs, ids, metas = [], [], []
-        for doc_id, text in docs_list:
+        successful = 0
+
+        for topic in topics:
+            text = fetch_wikipedia(topic)
+            time.sleep(0.3)  # be polite to Wikipedia API
+
+            if text:
+                for i, chunk in enumerate(chunk_text(text)):
+                    docs.append(chunk)
+                    ids.append(f"wiki_{topic}_{i}")
+                    metas.append({
+                        "source": f"Wikipedia: {topic.replace('_', ' ')}",
+                        "domain": domain,
+                        "topic":  topic,
+                    })
+                successful += 1
+            else:
+                logger.warning(f"Could not fetch Wikipedia article for '{topic}' — skipping.")
+
+        if not docs:
+            logger.warning("No Wikipedia articles fetched — using fallback sample docs.")
+            self._index_fallback(domain)
+            return
+
+        # Batch upsert into ChromaDB
+        batch_size = 100
+        for i in range(0, len(docs), batch_size):
+            self.col.upsert(
+                documents=docs[i:i+batch_size],
+                ids=ids[i:i+batch_size],
+                metadatas=metas[i:i+batch_size],
+            )
+
+        logger.info(
+            f"✅ Indexed {len(docs)} chunks from {successful}/{len(topics)} "
+            f"Wikipedia articles for domain '{domain}'"
+        )
+
+    def _index_fallback(self, domain: str):
+        """Use hardcoded fallback docs if Wikipedia is unavailable."""
+        fallback = FALLBACK_DOCS.get(domain, [])
+        docs, ids, metas = [], [], []
+        for doc_id, text in fallback:
             for i, chunk in enumerate(chunk_text(text)):
                 docs.append(chunk)
                 ids.append(f"{doc_id}_{i}")
                 metas.append({"source": doc_id, "domain": domain})
+        if docs:
+            self.col.upsert(documents=docs, ids=ids, metadatas=metas)
+            logger.info(f"Indexed {len(docs)} fallback chunks for '{domain}'")
 
-        self.col.upsert(documents=docs, ids=ids, metadatas=metas)
-        logger.info(f"Indexed {len(docs)} chunks for domain '{domain}'")
+    def index_wikipedia(self, topics: list[str], domain: str = "custom"):
+        """Index any list of Wikipedia topics directly."""
+        docs, ids, metas = [], [], []
+        for topic in topics:
+            text = fetch_wikipedia(topic)
+            time.sleep(0.3)
+            if text:
+                for i, chunk in enumerate(chunk_text(text)):
+                    docs.append(chunk)
+                    ids.append(f"wiki_{topic}_{i}")
+                    metas.append({"source": f"Wikipedia: {topic.replace('_',' ')}", "domain": domain})
+        if docs:
+            self.col.upsert(documents=docs, ids=ids, metadatas=metas)
+            logger.info(f"Indexed {len(docs)} chunks from {len(topics)} Wikipedia topics")
 
-    def index_sample(self):
-        """Index default healthcare sample (backward compatibility)."""
-        self.index_domain("healthcare")
+    def index_text_dir(self, directory: str):
+        """Index all .txt files in a directory."""
+        docs, ids, metas = [], [], []
+        for path in Path(directory).glob("**/*.txt"):
+            text = path.read_text(errors="ignore")
+            for i, chunk in enumerate(chunk_text(text)):
+                docs.append(chunk)
+                ids.append(f"{path.stem}_{i}")
+                metas.append({"source": str(path)})
+        if docs:
+            self.col.upsert(documents=docs, ids=ids, metadatas=metas)
+            logger.info(f"Indexed {len(docs)} chunks from {directory}")
 
     def index_squad(self, path: str, max_articles: int = 2000):
+        """Index SQuAD 2.0 dataset."""
         with open(path) as f:
             data = json.load(f)
         docs, ids, metas = [], [], []
@@ -189,58 +311,58 @@ class KnowledgeBase:
             self.col.upsert(documents=docs[i:i+500], ids=ids[i:i+500], metadatas=metas[i:i+500])
         logger.info(f"Indexed {len(docs)} SQuAD chunks.")
 
-    def index_text_dir(self, directory: str):
-        docs, ids, metas = [], [], []
-        for path in Path(directory).glob("**/*.txt"):
-            text = path.read_text(errors="ignore")
-            for i, chunk in enumerate(chunk_text(text)):
-                docs.append(chunk)
-                ids.append(f"{path.stem}_{i}")
-                metas.append({"source": str(path)})
-        if docs:
-            self.col.upsert(documents=docs, ids=ids, metadatas=metas)
-            logger.info(f"Indexed {len(docs)} chunks from {directory}")
-
     def retrieve(self, query: str, top_k: int = 5) -> list[dict]:
-        results = self.col.query(
-            query_texts=[query],
-            n_results=min(top_k, max(1, self.col.count()))
-        )
+        """Return top-k relevant chunks for a query."""
+        n = min(top_k, max(1, self.col.count()))
+        results = self.col.query(query_texts=[query], n_results=n)
         passages = []
         for doc, meta, dist in zip(
             results["documents"][0],
             results["metadatas"][0],
             results["distances"][0],
         ):
-            passages.append({"text": doc, "source": meta.get("source", ""), "distance": dist})
+            passages.append({
+                "text":   doc,
+                "source": meta.get("source", ""),
+                "distance": dist,
+            })
         return passages
 
     def count(self) -> int:
         return self.col.count()
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--sample",  action="store_true")
-    parser.add_argument("--domain",  type=str, choices=["healthcare","hr","legal"])
-    parser.add_argument("--squad",   type=str)
-    parser.add_argument("--textdir", type=str)
+    parser = argparse.ArgumentParser(description="VoiceRAG-Cache Knowledge Base Builder")
+    parser.add_argument("--domain",  type=str, choices=["healthcare","hr","legal"], default="healthcare")
+    parser.add_argument("--force",   action="store_true", help="Force reindex even if data exists")
+    parser.add_argument("--squad",   type=str, help="Path to SQuAD train-v2.0.json")
+    parser.add_argument("--textdir", type=str, help="Directory of .txt files to index")
     args = parser.parse_args()
 
-    domain = args.domain or "healthcare"
-    kb = KnowledgeBase(collection_name=f"kb_{domain}")
+    print(f"\n{'='*55}")
+    print(f"Building knowledge base — domain: {args.domain}")
+    print(f"{'='*55}\n")
 
-    if args.sample or (not args.squad and not args.textdir):
-        print(f"\nIndexing {domain} domain...")
-        kb.index_domain(domain)
+    kb = KnowledgeBase(collection_name=f"kb_{args.domain}")
+
     if args.squad:
         kb.index_squad(args.squad)
-    if args.textdir:
+    elif args.textdir:
         kb.index_text_dir(args.textdir)
+    else:
+        kb.index_domain(args.domain, force_reindex=args.force)
 
-    print(f"Total chunks: {kb.count()}")
-    results = kb.retrieve("What is the main topic of this knowledge base?", top_k=2)
+    print(f"\nTotal chunks indexed: {kb.count()}")
+    print("\nTest retrieval:")
+    test_queries = {
+        "healthcare": "What medications treat high blood pressure?",
+        "hr":         "How do I request time off from work?",
+        "legal":      "What is a non-disclosure agreement?",
+    }
+    results = kb.retrieve(test_queries.get(args.domain, "Tell me about this domain"), top_k=3)
     for r in results:
-        print(f"  [{r['distance']:.3f}] {r['text'][:100]}...")
-    print("\n✅ Knowledge base ready!")
+        print(f"  [{r['distance']:.3f}] [{r['source']}]")
+        print(f"           {r['text'][:120]}...")
+    print(f"\n✅ Knowledge base ready — {kb.count()} chunks from Wikipedia!")

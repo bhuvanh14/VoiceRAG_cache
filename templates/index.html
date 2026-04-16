@@ -671,12 +671,19 @@ async function runEval(){
   try{
     const res=await fetch("/eval",{method:"POST"});
     const data=await res.json();
+    if(data.error){alert("Eval error: "+data.error);return;}
     const body=document.getElementById("eval-body");body.innerHTML="";
-    data.forEach(r=>{
+    data.results.forEach(r=>{
       const tr=document.createElement("tr");
       tr.innerHTML=`<td>${r.name.replace(" (ours)","★")}</td><td>${r.hit_rate}%</td><td>${r.latency}</td><td>${r.speedup}×</td>`;
       body.appendChild(tr);
     });
+    // Show latency source note
+    const src=data.source||"defaults";
+    const lats=data.latencies_used||{};
+    let note=document.getElementById("eval-note");
+    if(!note){note=document.createElement("div");note.id="eval-note";note.style.cssText="font-family:var(--mono);font-size:9px;color:var(--muted);margin-top:8px;line-height:1.6";document.getElementById("eval-section").appendChild(note);}
+    note.innerHTML=`Source: ${src}<br>L1=${lats.l1}ms · L2=${lats.l2}ms · RAG=${lats.rag}ms`;
     document.getElementById("eval-section").style.display="block";
   }catch(e){alert("Eval error: "+e.message)}
   btn.textContent="Run evaluation vs LRU / LFU";btn.disabled=false;
